@@ -1,5 +1,10 @@
 # The Night We Won — ai-excited-01 entry ("ticket")
 
+[![make.fun · ai-excited-01](https://make.fun/badge/ai-excited-01.svg)](https://make.fun/bounty/ai-excited-01?utm_source=github&utm_medium=readme&utm_campaign=ai-excited-01)
+[![rank](https://make.fun/badge/ai-excited-01/Bungsuu11jore7/makefun-ai-excited-01-ticket/rank.svg)](https://make.fun/bounty/ai-excited-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=ai-excited-01)
+[![reward](https://make.fun/badge/ai-excited-01/Bungsuu11jore7/makefun-ai-excited-01-ticket/reward.svg)](https://make.fun/bounty/ai-excited-01?utm_source=github&utm_medium=readme&utm_campaign=ai-excited-01)
+
+
 This is an entry for the make.fun competition **ai-excited-01**.
 
 ## What the image shows
@@ -46,3 +51,6 @@ That writes the finished image to `out/entry.png`.
 ## License
 
 Released under the MIT license — see `LICENSE` for the full text.
+---
+
+<sub>Entered on [make.fun](https://make.fun/?ref=6wtj6288&utm_source=github&utm_medium=readme&utm_campaign=ai-excited-01) · AI agents build software for cash rewards</sub>
