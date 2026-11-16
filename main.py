@@ -1,489 +1,464 @@
 #!/usr/bin/env python3
-"""ai-excited-01 - "The Night We Won"
+"""The Night We Won — make.fun ai-excited-01 ticket entry.
 
-Pure-stdlib Python renderer (no PIL, no network, no external fonts).
-A creased final-match ticket stub, gold confetti bursting through a night
-stadium, and a supporter's handwritten note across it: "WE DID IT!!!
-3-2 IN EXTRA TIME". One clear subject, huge legible text, gold + red.
+Pure-stdlib Python 3 renderer. Draws a 1024x1024 night-stadium scene:
+a creased final-match ticket stub (EAGLES vs WOLVES, 3-2 in extra time)
+under gold confetti, with a supporter's handwritten note across it.
 
-Writes a deterministic 1024x1024 PNG to /output/entry.png
-(or $MAKEFUN_OUTPUT_DIR/entry.png outside the grader).
+Deterministic: every random choice comes from fixed-seed generators,
+so two runs produce byte-identical PNGs. Run with
+MAKEFUN_OUTPUT_DIR=out python3 main.py  ->  out/entry.png
 """
 
 import math
 import os
+import random
 import struct
 import zlib
 
 W, H = 1024, 1024
+OUT_ENV = "MAKEFUN_OUTPUT_DIR"
+CLEAR = (255, 0, 255)  # sentinel "transparent" colour for offscreen layers
 
-# --- palette -------------------------------------------------------------
-SKY_TOP = (10, 14, 48)
-SKY_MID = (38, 18, 72)
-SKY_LOW = (96, 16, 36)
-BEAM = (255, 244, 200)
-GOLD = (255, 196, 48)
-GOLD_DEEP = (224, 148, 20)
-GOLD_PALE = (255, 224, 130)
-RED = (214, 30, 44)
-RED_DARK = (140, 12, 28)
-RED_BRIGHT = (255, 64, 64)
-CREAM = (252, 242, 214)
-CREAM_DARK = (232, 214, 170)
-INK = (28, 20, 44)
-BLUE_INK = (34, 58, 158)
-WHITE = (255, 255, 255)
-CROWD = (12, 10, 30)
-TAPE = (255, 226, 120)
-
-
-class Canvas:
-    """RGB canvas backed by one bytearray; shapes clip to the edges."""
-
-    def __init__(self, w, h):
-        self.w = w
-        self.h = h
-        self.px = bytearray(w * h * 3)
-
-    def fill_rect(self, x, y, w, h, color):
-        x0 = max(0, x)
-        y0 = max(0, y)
-        x1 = min(self.w, x + w)
-        y1 = min(self.h, y + h)
-        if x1 <= x0 or y1 <= y0:
-            return
-        row = bytes(color) * (x1 - x0)
-        for yy in range(y0, y1):
-            o = (yy * self.w + x0) * 3
-            self.px[o:o + len(row)] = row
-
-    def set_px(self, x, y, color):
-        if 0 <= x < self.w and 0 <= y < self.h:
-            o = (y * self.w + x) * 3
-            self.px[o:o + 3] = bytes(color)
-
-    def blend_px(self, x, y, color, alpha):
-        if 0 <= x < self.w and 0 <= y < self.h:
-            o = (y * self.w + x) * 3
-            for i in range(3):
-                self.px[o + i] = round(
-                    self.px[o + i] + (color[i] - self.px[o + i]) * alpha)
-
-    def blend_rect(self, x, y, w, h, color, alpha):
-        x0 = max(0, x)
-        y0 = max(0, y)
-        x1 = min(self.w, x + w)
-        y1 = min(self.h, y + h)
-        for yy in range(y0, y1):
-            for xx in range(x0, x1):
-                self.blend_px(xx, yy, color, alpha)
-
-    def disc(self, cx, cy, r, color):
-        for dy in range(-r, r + 1):
-            yy = cy + dy
-            if yy < 0 or yy >= self.h:
-                continue
-            half = math.isqrt(max(0, r * r - dy * dy))
-            self.fill_rect(cx - half, yy, 2 * half + 1, 1, color)
-
-    def line(self, x0, y0, x1, y1, color, width=1):
-        steps = max(abs(x1 - x0), abs(y1 - y0), 1)
-        for i in range(steps + 1):
-            t = i / steps
-            x = round(x0 + (x1 - x0) * t)
-            y = round(y0 + (y1 - y0) * t)
-            self.fill_rect(x - width // 2, y - width // 2, width, width,
-                           color)
-
-    def poly(self, pts, color):
-        """Scanline polygon fill for a convex-ish polygon."""
-        ys = [p[1] for p in pts]
-        for y in range(max(0, min(ys)), min(self.h, max(ys) + 1)):
-            xs = []
-            n = len(pts)
-            for i in range(n):
-                x0, y0 = pts[i]
-                x1, y1 = pts[(i + 1) % n]
-                if (y0 <= y < y1) or (y1 <= y < y0):
-                    xs.append(x0 + (y - y0) * (x1 - x0) / (y1 - y0))
-            if len(xs) >= 2:
-                xs.sort()
-                self.fill_rect(int(xs[0]), y, int(xs[-1]) - int(xs[0]) + 1,
-                               1, color)
-
-    def blend_poly(self, pts, color, alpha):
-        ys = [p[1] for p in pts]
-        for y in range(max(0, min(ys)), min(self.h, max(ys) + 1)):
-            xs = []
-            n = len(pts)
-            for i in range(n):
-                x0, y0 = pts[i]
-                x1, y1 = pts[(i + 1) % n]
-                if (y0 <= y < y1) or (y1 <= y < y0):
-                    xs.append(x0 + (y - y0) * (x1 - x0) / (y1 - y0))
-            if len(xs) >= 2:
-                xs.sort()
-                self.blend_rect(int(xs[0]), y,
-                                int(xs[-1]) - int(xs[0]) + 1, 1, color,
-                                alpha)
-
-    def star(self, cx, cy, r, color):
-        """Four-point sparkle: two thin diamonds."""
-        self.poly([(cx, cy - r), (cx + r // 3, cy - r // 3),
-                   (cx + r, cy), (cx + r // 3, cy + r // 3),
-                   (cx, cy + r), (cx - r // 3, cy + r // 3),
-                   (cx - r, cy), (cx - r // 3, cy - r // 3)], color)
-
-
-# --- 5x7 bitmap font, drawn fresh for this entry ('#' = ink) --------------
-FONT = {
-    'A': (".###.", "#...#", "#...#", "#####", "#...#", "#...#", "#...#"),
-    'B': ("####.", "#...#", "#...#", "####.", "#...#", "#...#", "####."),
-    'C': (".####", "#....", "#....", "#....", "#....", "#....", ".####"),
-    'D': ("####.", "#...#", "#...#", "#...#", "#...#", "#...#", "####."),
-    'E': ("#####", "#....", "#....", "####.", "#....", "#....", "#####"),
-    'F': ("#####", "#....", "#....", "####.", "#....", "#....", "#...."),
-    'G': (".####", "#....", "#....", "#.###", "#...#", "#...#", ".###."),
-    'H': ("#...#", "#...#", "#...#", "#####", "#...#", "#...#", "#...#"),
-    'I': (".###.", "..#..", "..#..", "..#..", "..#..", "..#..", ".###."),
-    'J': ("..###", "....#", "....#", "....#", "....#", "#...#", ".###."),
-    'K': ("#...#", "#..#.", "#.#..", "##...", "#.#..", "#..#.", "#...#"),
-    'L': ("#....", "#....", "#....", "#....", "#....", "#....", "#####"),
-    'M': ("#...#", "##.##", "#.#.#", "#.#.#", "#...#", "#...#", "#...#"),
-    'N': ("#...#", "##..#", "#.#.#", "#..##", "#...#", "#...#", "#...#"),
-    'O': (".###.", "#...#", "#...#", "#...#", "#...#", "#...#", ".###."),
-    'P': ("####.", "#...#", "#...#", "####.", "#....", "#....", "#...."),
-    'Q': (".###.", "#...#", "#...#", "#...#", "#.#.#", "#..#.", ".##.#"),
-    'R': ("####.", "#...#", "#...#", "####.", "#.#..", "#..#.", "#...#"),
-    'S': (".####", "#....", "#....", ".###.", "....#", "....#", "####."),
-    'T': ("#####", "..#..", "..#..", "..#..", "..#..", "..#..", "..#.."),
-    'U': ("#...#", "#...#", "#...#", "#...#", "#...#", "#...#", ".###."),
-    'V': ("#...#", "#...#", "#...#", "#...#", "#...#", ".#.#.", "..#.."),
-    'W': ("#...#", "#...#", "#...#", "#.#.#", "#.#.#", "##.##", "#...#"),
-    'X': ("#...#", "#...#", ".#.#.", "..#..", ".#.#.", "#...#", "#...#"),
-    'Y': ("#...#", "#...#", ".#.#.", "..#..", "..#..", "..#..", "..#.."),
-    'Z': ("#####", "....#", "...#.", "..#..", ".#...", "#....", "#####"),
+# ---------------------------------------------------------------- font
+# Hand-drawn 5x7 pixel glyphs. '#' = ink, '.' = empty. Written from
+# scratch for this entry; only the characters the artwork needs.
+GLYPHS = {
+    "A": (".###.", "#...#", "#...#", "#####", "#...#", "#...#", "#...#"),
+    "B": ("####.", "#...#", "#...#", "####.", "#...#", "#...#", "####."),
+    "C": (".####", "#....", "#....", "#....", "#....", "#....", ".####"),
+    "D": ("####.", "#...#", "#...#", "#...#", "#...#", "#...#", "####."),
+    "E": ("#####", "#....", "#....", "####.", "#....", "#....", "#####"),
+    "F": ("#####", "#....", "#....", "####.", "#....", "#....", "#...."),
+    "G": (".####", "#....", "#....", "#.###", "#...#", "#...#", ".###."),
+    "H": ("#...#", "#...#", "#...#", "#####", "#...#", "#...#", "#...#"),
+    "I": ("#####", "..#..", "..#..", "..#..", "..#..", "..#..", "#####"),
+    "J": ("..###", "...#.", "...#.", "...#.", "...#.", "#..#.", ".##.."),
+    "K": ("#...#", "#..#.", "#.#..", "##...", "#.#..", "#..#.", "#...#"),
+    "L": ("#....", "#....", "#....", "#....", "#....", "#....", "#####"),
+    "M": ("#...#", "##.##", "#.#.#", "#.#.#", "#...#", "#...#", "#...#"),
+    "N": ("#...#", "##..#", "##..#", "#.#.#", "#..##", "#..##", "#...#"),
+    "O": (".###.", "#...#", "#...#", "#...#", "#...#", "#...#", ".###."),
+    "P": ("####.", "#...#", "#...#", "####.", "#....", "#....", "#...."),
+    "Q": (".###.", "#...#", "#...#", "#...#", "#.#.#", "#..#.", ".##.#"),
+    "R": ("####.", "#...#", "#...#", "####.", "#.#..", "#..#.", "#...#"),
+    "S": (".####", "#....", "#....", ".###.", "....#", "....#", "####."),
+    "T": ("#####", "..#..", "..#..", "..#..", "..#..", "..#..", "..#.."),
+    "U": ("#...#", "#...#", "#...#", "#...#", "#...#", "#...#", ".###."),
+    "V": ("#...#", "#...#", "#...#", "#...#", "#...#", ".#.#.", "..#.."),
+    "W": ("#...#", "#...#", "#...#", "#.#.#", "#.#.#", "##.##", "#...#"),
+    "X": ("#...#", "#...#", ".#.#.", "..#..", ".#.#.", "#...#", "#...#"),
+    "Y": ("#...#", "#...#", ".#.#.", "..#..", "..#..", "..#..", "..#.."),
+    "Z": ("#####", "....#", "...#.", "..#..", ".#...", "#....", "#####"),
+    "0": (".###.", "#..##", "#.#.#", "##..#", "#...#", "#...#", ".###."),
+    "1": ("..#..", ".##..", "..#..", "..#..", "..#..", "..#..", ".###."),
+    "2": (".###.", "#...#", "....#", "...#.", "..#..", ".#...", "#####"),
+    "3": ("####.", "....#", "....#", ".###.", "....#", "....#", "####."),
+    "4": ("...#.", "..##.", ".#.#.", "#..#.", "#####", "...#.", "...#."),
+    "5": ("#####", "#....", "####.", "....#", "....#", "#...#", ".###."),
+    "6": (".###.", "#....", "#....", "####.", "#...#", "#...#", ".###."),
+    "7": ("#####", "....#", "...#.", "...#.", "..#..", "..#..", "..#.."),
+    "8": (".###.", "#...#", "#...#", ".###.", "#...#", "#...#", ".###."),
+    "9": (".###.", "#...#", "#...#", ".####", "....#", "....#", ".###."),
+    "!": ("..#..", "..#..", "..#..", "..#..", "..#..", ".....", "..#.."),
+    "-": (".....", ".....", ".....", "#####", ".....", ".....", "....."),
+    ".": (".....", ".....", ".....", ".....", ".....", ".....", "..#.."),
+    ",": (".....", ".....", ".....", ".....", ".....", "..#..", ".#..."),
+    ":": (".....", "..#..", ".....", ".....", ".....", "..#..", "....."),
+    "'": ("..#..", "..#..", ".....", ".....", ".....", ".....", "....."),
+    "/": ("....#", "...#.", "...#.", "..#..", "..#..", ".#...", "#...."),
+    "(": ("...#.", "..#..", ".#...", ".#...", ".#...", "..#..", "...#."),
+    ")": (".#...", "..#..", "...#.", "...#.", "...#.", "..#..", ".#..."),
+    "&": (".##..", "#..#.", "#.#..", ".#...", "#.#.#", "#..#.", ".##.#"),
+    "+": (".....", "..#..", "..#..", "#####", "..#..", "..#..", "....."),
+    "=": (".....", ".....", "#####", ".....", "#####", ".....", "....."),
+    " ": (".....", ".....", ".....", ".....", ".....", ".....", "....."),
 }
 
-FONT.update({
-    '0': (".###.", "#...#", "#..##", "#.#.#", "##..#", "#...#", ".###."),
-    '1': ("..#..", ".##..", "..#..", "..#..", "..#..", "..#..", ".###."),
-    '2': (".###.", "#...#", "....#", "...#.", "..#..", ".#...", "#####"),
-    '3': ("####.", "....#", "....#", ".###.", "....#", "....#", "####."),
-    '4': ("...#.", "..##.", ".#.#.", "#..#.", "#####", "...#.", "...#."),
-    '5': ("#####", "#....", "####.", "....#", "....#", "#...#", ".###."),
-    '6': (".###.", "#....", "#....", "####.", "#...#", "#...#", ".###."),
-    '7': ("#####", "....#", "...#.", "..#..", "..#..", "..#..", "..#.."),
-    '8': (".###.", "#...#", "#...#", ".###.", "#...#", "#...#", ".###."),
-    '9': (".###.", "#...#", "#...#", ".####", "....#", "....#", ".###."),
-    '.': (".....", ".....", ".....", ".....", ".....", ".##..", ".##.."),
-    ',': (".....", ".....", ".....", ".....", ".....", ".##..", ".#..."),
-    '!': ("..#..", "..#..", "..#..", "..#..", "..#..", ".....", "..#.."),
-    '-': (".....", ".....", ".....", "#####", ".....", ".....", "....."),
-    ':': (".....", ".##..", ".##..", ".....", ".##..", ".##..", "....."),
-    "'": ("..#..", "..#..", ".#...", ".....", ".....", ".....", "....."),
-    '/': ("....#", "....#", "...#.", "..#..", ".#...", "#....", "#...."),
-    ' ': (".....", ".....", ".....", ".....", ".....", ".....", "....."),
-})
+GLYPH_W, GLYPH_H = 5, 7
 
 
-def text_width(s, scale):
-    return len(s) * 6 * scale - scale
+def text_width(s, scale, tracking=1):
+    """Pixel width of a string at a given glyph scale."""
+    if not s:
+        return 0
+    return len(s) * (GLYPH_W + tracking) * scale - tracking * scale
 
 
-def draw_text(cv, s, x, y, scale, color, skew=0):
-    """Left-aligned bitmap text; skew shifts each row right (italic lean)."""
-    for ch in s:
-        glyph = FONT.get(ch)
-        if glyph:
-            for r, line in enumerate(glyph):
-                for c, bit in enumerate(line):
-                    if bit == '#':
-                        cv.fill_rect(x + c * scale + r * skew,
-                                     y + r * scale, scale, scale, color)
-        x += 6 * scale
+# ---------------------------------------------------------------- canvas
+class Pix:
+    """A plain RGB canvas backed by one bytearray."""
+
+    def __init__(self, w, h, fill=(0, 0, 0)):
+        self.w, self.h = w, h
+        self.buf = bytearray(w * h * 3)
+        for i in range(0, len(self.buf), 3):
+            self.buf[i] = fill[0]
+            self.buf[i + 1] = fill[1]
+            self.buf[i + 2] = fill[2]
+
+    def _idx(self, x, y):
+        return (y * self.w + x) * 3
+
+    def inside(self, x, y):
+        return 0 <= x < self.w and 0 <= y < self.h
+
+    def put(self, x, y, col):
+        if self.inside(x, y):
+            i = self._idx(x, y)
+            self.buf[i] = col[0]
+            self.buf[i + 1] = col[1]
+            self.buf[i + 2] = col[2]
+
+    def blend(self, x, y, col, a):
+        """Alpha-blend colour `col` over pixel (x, y); a in 0..1."""
+        if not self.inside(x, y) or a <= 0:
+            return
+        if a >= 1:
+            self.put(x, y, col)
+            return
+        i = self._idx(x, y)
+        b = self.buf
+        b[i] = int(b[i] + (col[0] - b[i]) * a)
+        b[i + 1] = int(b[i + 1] + (col[1] - b[i + 1]) * a)
+        b[i + 2] = int(b[i + 2] + (col[2] - b[i + 2]) * a)
+
+    def get(self, x, y):
+        if not self.inside(x, y):
+            return (0, 0, 0)
+        i = self._idx(x, y)
+        return (self.buf[i], self.buf[i + 1], self.buf[i + 2])
+
+    def rect(self, x, y, w, h, col, alpha=1.0):
+        for yy in range(y, y + h):
+            for xx in range(x, x + w):
+                self.blend(xx, yy, col, alpha)
+
+    def disc(self, cx, cy, r, col, alpha=1.0):
+        for yy in range(cy - r, cy + r + 1):
+            for xx in range(cx - r, cx + r + 1):
+                if (xx - cx) ** 2 + (yy - cy) ** 2 <= r * r:
+                    self.blend(xx, yy, col, alpha)
+
+    def line(self, x0, y0, x1, y1, col, thick=1, alpha=1.0):
+        """Bresenham line with square brush of side `thick`."""
+        dx = abs(x1 - x0)
+        dy = -abs(y1 - y0)
+        sx = 1 if x0 < x1 else -1
+        sy = 1 if y0 < y1 else -1
+        err = dx + dy
+        half = thick // 2
+        while True:
+            for oy in range(-half, half + 1):
+                for ox in range(-half, half + 1):
+                    self.blend(x0 + ox, y0 + oy, col, alpha)
+            if x0 == x1 and y0 == y1:
+                break
+            e2 = 2 * err
+            if e2 >= dy:
+                err += dy
+                x0 += sx
+            if e2 <= dx:
+                err += dx
+                y0 += sy
+
+    def poly(self, pts, col, alpha=1.0):
+        """Scanline fill of a simple polygon (list of (x, y))."""
+        if len(pts) < 3:
+            return
+        ys = [p[1] for p in pts]
+        for yy in range(min(ys), max(ys) + 1):
+            xs = []
+            n = len(pts)
+            for i in range(n):
+                ax, ay = pts[i]
+                bx, by = pts[(i + 1) % n]
+                if ay == by:
+                    continue
+                if (ay <= yy < by) or (by <= yy < ay):
+                    t = (yy - ay) / (by - ay)
+                    xs.append(ax + t * (bx - ax))
+            xs.sort()
+            for k in range(0, len(xs) - 1, 2):
+                for xx in range(int(xs[k]), int(xs[k + 1]) + 1):
+                    self.blend(xx, yy, col, alpha)
+
+    def star4(self, cx, cy, r, col, alpha=1.0):
+        """Four-point sparkle: a tall thin diamond + a wide flat one."""
+        self.poly([(cx, cy - r), (cx + r // 4, cy), (cx, cy + r),
+                   (cx - r // 4, cy)], col, alpha)
+        self.poly([(cx - r, cy), (cx, cy - r // 4), (cx + r, cy),
+                   (cx, cy + r // 4)], col, alpha)
+
+    def blit_rotated(self, src, cx, cy, deg):
+        """Paste `src` centred at (cx, cy), rotated by `deg` degrees.
+
+        Pixels equal to CLEAR in the source are treated as transparent.
+        Nearest-neighbour sampling; deterministic.
+        """
+        rad = math.radians(deg)
+        co, si = math.cos(rad), math.sin(rad)
+        hw, hh = src.w / 2.0, src.h / 2.0
+        x0 = int(cx - (abs(hw * co) + abs(hh * si))) - 2
+        x1 = int(cx + (abs(hw * co) + abs(hh * si))) + 2
+        y0 = int(cy - (abs(hw * si) + abs(hh * co))) - 2
+        y1 = int(cy + (abs(hw * si) + abs(hh * co))) + 2
+        for yy in range(y0, y1 + 1):
+            for xx in range(x0, x1 + 1):
+                dx, dy = xx - cx, yy - cy
+                sx = int(dx * co + dy * si + hw)
+                sy = int(-dx * si + dy * co + hh)
+                if 0 <= sx < src.w and 0 <= sy < src.h:
+                    col = src.get(sx, sy)
+                    if col != CLEAR:
+                        self.put(xx, yy, col)
 
 
-def draw_text_c(cv, s, cx, y, scale, color, skew=0):
-    draw_text(cv, s, cx - text_width(s, scale) // 2, y, scale, color, skew)
+def draw_text(cv, x, y, s, scale, col, shear=0, wobble=None, tracking=1):
+    """Draw a string with the 5x7 glyphs.
+
+    shear shifts each glyph row sideways (italic slant); wobble is an
+    optional list of per-character vertical offsets (handwritten feel).
+    """
+    cx = x
+    for ci, ch in enumerate(s):
+        rows = GLYPHS.get(ch.upper(), GLYPHS[" "])
+        dy = 0
+        if wobble:
+            dy = wobble[ci % len(wobble)]
+        for ry, row in enumerate(rows):
+            for rx, bit in enumerate(row):
+                if bit == "#":
+                    bx = cx + rx * scale + int(shear * (GLYPH_H - ry))
+                    by = y + ry * scale + dy
+                    cv.rect(bx, by, scale, scale, col)
+        cx += (GLYPH_W + tracking) * scale
 
 
-def draw_text_outline(cv, s, cx, y, scale, color, edge, skew=0):
-    """Text with a 1-cell outline: draw edge colour offset in 8 directions."""
-    w = text_width(s, scale)
-    x0 = cx - w // 2
-    for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1),
-                   (-1, -1), (1, -1), (-1, 1), (1, 1)):
-        draw_text(cv, s, x0 + dx * scale, y + dy * scale, scale, edge, skew)
-    draw_text(cv, s, x0, y, scale, color, skew)
+# ---------------------------------------------------------------- PNG out
+def _chunk(kind, payload):
+    out = struct.pack(">I", len(payload)) + kind + payload
+    out += struct.pack(">I", zlib.crc32(kind + payload) & 0xFFFFFFFF)
+    return out
 
 
-def png_bytes(rgb, w, h):
-    raw = b''.join(b'\x00' + bytes(rgb[y * w * 3:(y + 1) * w * 3])
-                   for y in range(h))
-
-    def chunk(tag, data):
-        return (struct.pack('>I', len(data)) + tag + data +
-                struct.pack('>I', zlib.crc32(tag + data) & 0xffffffff))
-
-    ihdr = struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0)
-    return (b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', ihdr) +
-            chunk(b'IDAT', zlib.compress(raw, 9)) + chunk(b'IEND', b''))
-
-
-def lcg(state):
-    return (state * 1103515245 + 12345) & 0x7fffffff
+def encode_png(cv):
+    sig = b"\x89PNG\r\n\x1a\n"
+    ihdr = struct.pack(">IIBBBBB", cv.w, cv.h, 8, 2, 0, 0, 0)
+    raw = bytearray()
+    stride = cv.w * 3
+    for y in range(cv.h):
+        raw.append(0)  # filter: none
+        raw += cv.buf[y * stride:(y + 1) * stride]
+    idat = zlib.compress(bytes(raw), 9)
+    return sig + _chunk(b"IHDR", ihdr) + _chunk(b"IDAT", idat) + _chunk(b"IEND", b"")
 
 
-def draw_background(cv):
-    """Night stadium: navy-to-crimson gradient, floodlight beams,
-    gold burst rays from behind the ticket, crowd along the bottom."""
+# ---------------------------------------------------------------- palette
+NAVY = (24, 24, 64)
+SKY_TOP = (13, 12, 44)
+SKY_MID = (52, 24, 76)
+SKY_LOW = (96, 32, 66)
+GOLD = (255, 198, 66)
+GOLD_DEEP = (232, 168, 32)
+RED = (178, 26, 38)
+RED_DARK = (140, 18, 30)
+CREAM = (250, 240, 205)
+CREAM_NOTE = (253, 245, 216)
+INK_BLUE = (38, 68, 180)
+WHITE = (245, 245, 240)
+DARK = (10, 10, 26)
+
+
+def _lerp(a, b, t):
+    return tuple(int(a[i] + (b[i] - a[i]) * t) for i in range(3))
+
+
+# ---------------------------------------------------------------- backdrop
+def paint_sky(cv, rng):
+    """Night gradient, stars, floodlight beams and glowing towers."""
     for y in range(H):
-        if y < 560:
-            t = y / 560.0
-            c = tuple(round(SKY_TOP[i] + (SKY_MID[i] - SKY_TOP[i]) * t)
-                      for i in range(3))
+        t = y / (H - 1)
+        if t < 0.62:
+            col = _lerp(SKY_TOP, SKY_MID, t / 0.62)
         else:
-            t = (y - 560) / 464.0
-            c = tuple(round(SKY_MID[i] + (SKY_LOW[i] - SKY_MID[i]) * t)
-                      for i in range(3))
-        o = y * W * 3
-        cv.px[o:o + W * 3] = bytes(c) * W
+            col = _lerp(SKY_MID, SKY_LOW, (t - 0.62) / 0.38)
+        cv.rect(0, y, W, 1, col)
+    # stars
+    for _ in range(150):
+        x = rng.randrange(0, W)
+        y = rng.randrange(0, 420)
+        r = rng.choice([1, 1, 1, 2])
+        cv.disc(x, y, r, WHITE, alpha=rng.choice([0.35, 0.55, 0.8]))
+    # floodlight beams fanning down from the top corners
+    for bx, spread in ((170, 260), (854, 260)):
+        for k in range(3):
+            off = (k - 1) * 90
+            cv.poly([(bx + off, 0), (bx + off + 60, 0),
+                     (bx + off + spread, H), (bx + off + spread - 170, H)],
+                    (255, 244, 200), alpha=0.045)
+    # floodlight towers: halo + bright lamp grid (kept clear of headline)
+    for tx, ty in ((64, 215), (960, 215)):
+        cv.disc(tx, ty, 62, (255, 240, 180), alpha=0.10)
+        cv.disc(tx, ty, 30, (255, 246, 210), alpha=0.22)
+        for gy in range(ty - 14, ty + 16, 10):
+            for gx in range(tx - 22, tx + 23, 11):
+                cv.disc(gx, gy, 4, (255, 252, 230))
 
-    # floodlight beams from the top corners, soft translucent wedges
-    cv.blend_poly([(0, 0), (330, 0), (700, 1024), (300, 1024)],
-                  BEAM, 0.10)
-    cv.blend_poly([(1024, 0), (694, 0), (330, 1024), (724, 1024)],
-                  BEAM, 0.10)
-    cv.blend_poly([(0, 0), (150, 0), (560, 1024), (380, 1024)],
-                  BEAM, 0.07)
-    cv.blend_poly([(1024, 0), (874, 0), (470, 1024), (650, 1024)],
-                  BEAM, 0.07)
 
-    # gold burst rays radiating from the ticket centre (512, 560)
-    cx, cy = 512, 560
-    for k in range(24):
-        a = math.radians(k * 15.0 + 7.5)
-        a2 = math.radians(k * 15.0 + 11.0)
-        far = 780
-        col = GOLD if k % 2 == 0 else GOLD_PALE
-        cv.blend_poly(
-            [(cx, cy),
-             (cx + int(760 * math.cos(a)), cy + int(760 * math.sin(a))),
-             (cx + int(760 * math.cos(a2)), cy + int(760 * math.sin(a2)))],
-            col, 0.10 if k % 2 == 0 else 0.06)
+def paint_stands(cv, rng):
+    """Tiered stands with pinprick crowd lights, then a front-row mass."""
+    for band_y, hgt, shade in ((640, 70, (26, 20, 52)),
+                               (712, 80, (20, 15, 42)),
+                               (794, 90, (15, 11, 34))):
+        cv.rect(0, band_y, W, hgt, shade)
+        cv.line(0, band_y, W, band_y, (70, 60, 110), thick=2, alpha=0.7)
+        for _ in range(260):
+            x = rng.randrange(0, W)
+            y = rng.randrange(band_y + 8, band_y + hgt - 6)
+            cv.disc(x, y, 1, rng.choice([GOLD, WHITE, (150, 180, 255),
+                                          (255, 120, 120)]),
+                    alpha=rng.choice([0.4, 0.6, 0.9]))
+    # front-row silhouette: overlapping heads along the bottom edge
+    x = -20
+    while x < W + 20:
+        r = rng.randrange(24, 42)
+        cv.disc(x, H + 6, r, DARK)
+        x += rng.randrange(28, 48)
+    x = 10
+    while x < W + 20:
+        r = rng.randrange(16, 26)
+        cv.disc(x, H - 26, r, (14, 13, 30))
+        x += rng.randrange(30, 52)
 
-    # stadium light dots, two rows of tiny floodlights
-    for x in range(60, 1024, 88):
-        cv.disc(x, 46, 7, GOLD_PALE)
-        cv.disc(x, 46, 3, WHITE)
-    for x in range(104, 1024, 88):
-        cv.disc(x, 92, 5, GOLD)
-        cv.disc(x, 92, 2, WHITE)
 
-    # crowd: dark heads + raised arms along the bottom
-    state = 20240
-    for x in range(-20, 1060, 34):
-        state = lcg(state)
-        r = 20 + state % 14
-        cv.disc(x, 1024 - 8, r + 14, CROWD)
-        cv.disc(x, 1000 - r, r, CROWD)
-    for x in range(10, 1020, 52):
-        state = lcg(state)
-        arm = 30 + state % 26
-        cv.line(x, 1000, x - 12, 1000 - arm, CROWD, 7)
-        cv.line(x + 26, 1002, x + 38, 1002 - arm, CROWD, 7)
+# ---------------------------------------------------------------- ticket
+def make_ticket(rng):
+    """The creased final-match stub, drawn flat on its own layer."""
+    tw, th = 880, 440
+    t = Pix(tw, th, fill=CLEAR)
+    t.rect(0, 0, tw, th, CREAM)
+    t.rect(4, 4, tw - 8, th - 8, RED)              # outer frame
+    t.rect(10, 10, tw - 20, th - 20, CREAM)
+    # thin gold inner frame
+    t.rect(22, 22, tw - 44, 3, GOLD_DEEP)
+    t.rect(22, th - 25, tw - 44, 3, GOLD_DEEP)
+    t.rect(22, 22, 3, th - 44, GOLD_DEEP)
+    t.rect(tw - 25, 22, 3, th - 44, GOLD_DEEP)
+    # header + teams
+    draw_text(t, 48, 42, "THE FINAL", 4, RED)
+    draw_text(t, 48, 96, "EAGLES", 8, NAVY)
+    draw_text(t, 48, 178, "VS", 4, RED)
+    draw_text(t, 148, 168, "WOLVES", 8, NAVY)
+    # gold extra-time bar
+    t.rect(48, 250, 420, 64, GOLD)
+    draw_text(t, 138, 268, "EXTRA TIME", 4, NAVY)
+    # seat details
+    draw_text(t, 48, 336, "ADMIT ONE", 4, RED)
+    draw_text(t, 48, 382, "ROW 7 - SEAT 12", 3, NAVY)
+    draw_text(t, 408, 382, "SAT 15 NOV", 3, NAVY)
+    # perforation between stub and main body
+    for y in range(28, th - 24, 14):
+        t.rect(640, y, 3, 8, RED_DARK)
+    t.disc(640, 14, 9, NAVY)
+    t.disc(640, th - 14, 9, NAVY)
+    # score stub
+    draw_text(t, 668, 82, "3-2", 11, RED)
+    draw_text(t, 668, 182, "WINNERS", 4, NAVY)
+    # barcode: deterministic bar widths
+    bx = 668
+    while bx < 856:
+        bw = rng.choice([2, 3, 3, 4, 5, 7])
+        t.rect(bx, 238, bw, 108, NAVY)
+        bx += bw + rng.choice([2, 3, 4, 6])
+    draw_text(t, 668, 356, "NO. 0719", 3, NAVY)
+    # creases: pale diagonal wear + one hard fold
+    t.line(60, 0, 300, th, (190, 170, 120), thick=2, alpha=0.28)
+    t.line(700, 0, 520, th, (190, 170, 120), thick=2, alpha=0.22)
+    t.line(0, 300, tw, 240, (150, 128, 84), thick=3, alpha=0.20)
+    # masking-tape corner, top right
+    t.rect(748, 0, 100, 34, (255, 226, 130), alpha=0.55)
+    t.line(748, 34, 848, 34, (200, 170, 80), thick=2, alpha=0.5)
+    return t
 
-    # confetti: fixed-seed deterministic pieces over the whole scene
-    confetti = (GOLD, GOLD_PALE, RED_BRIGHT, WHITE, (120, 180, 255),
-                GOLD_DEEP)
-    state = 987654321
-    for _ in range(260):
-        state = lcg(state)
-        x = 20 + state % 984
-        state = lcg(state)
-        y = 20 + state % 984
-        state = lcg(state)
-        size = 5 + state % 9
-        state = lcg(state)
-        col = confetti[state % len(confetti)]
-        state = lcg(state)
-        kind = state % 3
+
+# ---------------------------------------------------------------- note
+def make_note():
+    """Supporter's handwritten note on a torn paper strip."""
+    nw, nh = 920, 170
+    n = Pix(nw, nh, fill=CLEAR)
+    n.rect(0, 0, nw, nh, CREAM_NOTE)
+    n.rect(0, nh - 6, nw, 6, RED)                  # red rule along the foot
+    n.rect(0, 0, nw, 3, (210, 190, 140))
+    wob1 = [0, -3, 2, -2, 0, 3, -2, 0, 2, -3, 0, 2]
+    wob2 = [2, 0, -2, 3, 0, -3, 2, 0, -2, 3, 0, -2, 2, 0, -3, 2, 0]
+    draw_text(n, 56, 20, "WE DID IT!!!", 6, INK_BLUE, shear=1, wobble=wob1)
+    draw_text(n, 56, 86, "3-2 IN EXTRA TIME", 6, INK_BLUE, shear=1, wobble=wob2)
+    # red underline swoosh under the second line
+    n.line(56, 148, 690, 140, RED, thick=4, alpha=0.85)
+    n.line(60, 156, 520, 150, RED, thick=2, alpha=0.5)
+    n.star4(838, 62, 26, GOLD_DEEP)
+    n.star4(872, 110, 14, GOLD)
+    return n
+
+
+# ---------------------------------------------------------------- confetti
+def scatter_confetti(cv, rng, count):
+    """Gold-led confetti: squares, diamonds and plus signs."""
+    palette = [GOLD, GOLD, GOLD_DEEP, (255, 90, 90), WHITE,
+               (120, 170, 255), (255, 240, 180)]
+    for _ in range(count):
+        x = rng.randrange(8, W - 8)
+        y = rng.randrange(8, H - 8)
+        col = rng.choice(palette)
+        kind = rng.randrange(3)
+        s = rng.randrange(3, 9)
         if kind == 0:
-            cv.fill_rect(x, y, size, size // 2 + 2, col)
+            cv.rect(x - s // 2, y - s // 2, s, s, col)
         elif kind == 1:
-            cv.poly([(x, y - size // 2), (x + size // 2, y),
-                     (x, y + size // 2), (x - size // 2, y)], col)
+            cv.poly([(x, y - s), (x + s // 2, y), (x, y + s),
+                     (x - s // 2, y)], col)
         else:
-            cv.line(x - size // 2, y, x + size // 2, y, col, 3)
-            cv.line(x, y - size // 2, x, y + size // 2, col, 3)
-    # a few big sparkles
-    for sx, sy, sr in ((150, 210, 26), (880, 180, 30), (920, 830, 24),
-                       (110, 800, 22), (880, 262, 20)):
-        cv.star(sx, sy, sr, GOLD_PALE)
-        cv.star(sx, sy, sr // 2, WHITE)
+            cv.line(x - s, y, x + s, y, col, thick=2)
+            cv.line(x, y - s, x, y + s, col, thick=2)
 
 
-def draw_text_slope(cv, s, x, y, scale, color, slope, skew=0):
-    """Text following a slope: each glyph drops by slope per pixel of x."""
-    x0 = x
-    for ch in s:
-        glyph = FONT.get(ch)
-        gy = y + int(slope * (x - x0))
-        if glyph:
-            for r, line in enumerate(glyph):
-                for c, bit in enumerate(line):
-                    if bit == '#':
-                        cv.fill_rect(x + c * scale + r * skew,
-                                     gy + r * scale, scale, scale, color)
-        x += 6 * scale
+# ---------------------------------------------------------------- compose
+def render():
+    rng = random.Random(20261116)
+    cv = Pix(W, H, fill=SKY_TOP)
+    paint_sky(cv, rng)
+    paint_stands(cv, rng)
 
+    # headline with a dark-red drop outline, then gold on top
+    head = "THE NIGHT WE WON"
+    hx = (W - text_width(head, 9)) // 2
+    for ox, oy in ((-4, 0), (4, 0), (0, -4), (0, 4), (-4, -4), (4, 4)):
+        draw_text(cv, hx + ox, 62 + oy, head, 9, RED_DARK)
+    draw_text(cv, hx, 62, head, 9, GOLD)
+    sub = "ONE TICKET. ONE NIGHT. FOREVER."
+    draw_text(cv, (W - text_width(sub, 2)) // 2, 152, sub, 2,
+              (255, 226, 150))
 
-def ticket_point(u, v):
-    """Ticket-local (u right, v down) -> screen coords; top edge slopes
-    gently down to the right, giving the whole stub a dynamic tilt."""
-    return (150 + u, int(400 - 0.096 * u + v))
-
-
-def draw_ticket(cv):
-    # red outer edge, then cream face, slightly inset
-    outer = [ticket_point(u, v) for u, v in
-             ((-8, -8), (738, -8), (738, 398), (-8, 398))]
-    cv.poly(outer, RED_DARK)
-    face = [ticket_point(u, v) for u, v in
-            ((0, 0), (730, 0), (730, 390), (0, 390))]
-    cv.poly(face, CREAM)
-    # inner gold frame
-    frame = [ticket_point(u, v) for u, v in
-             ((14, 14), (716, 14), (716, 376), (14, 376))]
-    for i in range(4):
-        x0, y0 = frame[i]
-        x1, y1 = frame[(i + 1) % 4]
-        cv.line(x0, y0, x1, y1, GOLD_DEEP, 3)
-    # punched notches on the left and right edges
-    nx, ny = ticket_point(0, 195)
-    cv.disc(nx, ny, 16, SKY_MID)
-    nx, ny = ticket_point(730, 195)
-    cv.disc(nx, ny, 16, SKY_MID)
-    # crease lines: the stub has been folded in a pocket all night
-    for (u0, v0, u1, v1) in ((90, 0, 190, 390), (620, 0, 560, 390)):
-        a = ticket_point(u0, v0)
-        b = ticket_point(u1, v1)
-        cv.line(a[0], a[1], b[0], b[1], CREAM_DARK, 3)
-    # perforation between the main ticket and the stub
-    for k in range(26):
-        v = 8 + k * 15
-        a = ticket_point(500, v)
-        b = ticket_point(500, v + 8)
-        cv.line(a[0], a[1], b[0], b[1], RED_DARK, 3)
-
-    slope = -0.096
-    # --- left section: the match --------------------------------------
-    x, y = ticket_point(40, 42)
-    draw_text_slope(cv, "THE FINAL", x, y, 4, RED, slope)
-    x, y = ticket_point(40, 108)
-    draw_text_slope(cv, "EAGLES", x, y, 5, INK, slope)
-    x, y = ticket_point(40, 168)
-    draw_text_slope(cv, "VS", x, y, 4, RED, slope)
-    x, y = ticket_point(150, 168)
-    draw_text_slope(cv, "WOLVES", x, y, 5, INK, slope)
-    # gold band: extra time
-    band = [ticket_point(u, v) for u, v in
-            ((40, 238), (470, 238), (470, 288), (40, 288))]
-    cv.poly(band, GOLD)
-    x, y = ticket_point(52, 248)
-    draw_text_slope(cv, "EXTRA TIME", x, y, 3, INK, slope)
-    x, y = ticket_point(40, 312)
-    draw_text_slope(cv, "ADMIT ONE", x, y, 3, RED_DARK, slope)
-    x, y = ticket_point(300, 312)
-    draw_text_slope(cv, "SAT 15 NOV", x, y, 3, INK, slope)
-    x, y = ticket_point(40, 348)
-    draw_text_slope(cv, "ROW 7 - SEAT 12", x, y, 2, INK, slope)
-
-    # --- right stub: the score, huge ------------------------------------
-    x, y = ticket_point(528, 96)
-    draw_text_slope(cv, "3-2", x, y, 11, RED, slope)
-    x, y = ticket_point(528, 200)
-    draw_text_slope(cv, "WINNERS", x, y, 3, INK, slope)
-    # barcode stripes along the stub bottom
-    state = 555
-    bx = 528
-    while bx < 700:
-        state = lcg(state)
-        wdt = 3 + state % 6
-        a = ticket_point(bx, 300)
-        b = ticket_point(bx, 360)
-        cv.line(a[0], a[1], b[0], b[1], INK, wdt)
-        bx += wdt + 4 + state % 5
-    # tape holding the stub's top corner
-    tape = [ticket_point(u, v) for u, v in
-            ((640, -16), (730, -16), (730, 22), (640, 22))]
-    cv.poly(tape, TAPE)
-
-
-def draw_note(cv):
-    """The supporter's handwritten note, torn paper strip across the
-    ticket's lower half, blue ink with a red underline swash."""
-    strip = [(90, 800), (950, 730), (950, 852), (90, 922)]
-    cv.poly(strip, (255, 250, 235))
-    cv.line(90, 800, 950, 730, RED, 4)
-    cv.line(950, 852, 90, 922, RED, 4)
-    # torn left edge: small zigzag
-    for k in range(6):
-        y0 = 800 + k * 20
-        cv.line(90, y0, 98, y0 + 10, (255, 250, 235), 6)
-    slope = -0.081
-    draw_text_slope(cv, "WE DID IT!!!", 150, 806, 5, BLUE_INK, slope, skew=1)
-    draw_text_slope(cv, "3-2 IN EXTRA TIME", 150, 862, 4, BLUE_INK, slope,
-                    skew=1)
-    # red underline swash under the second line
-    cv.line(150, 902, 500, 874, RED_BRIGHT, 5)
-    cv.line(500, 874, 545, 864, RED_BRIGHT, 5)
-    # a small gold star the fan drew next to the note
-    cv.star(880, 796, 22, GOLD_DEEP)
-    cv.star(880, 796, 12, GOLD)
+    scatter_confetti(cv, rng, 240)          # confetti behind the ticket
+    cv.blit_rotated(make_ticket(rng), 512, 530, -4)
+    cv.blit_rotated(make_note(), 512, 862, 3)
+    scatter_confetti(cv, rng, 170)          # confetti raining in front
+    cv.star4(150, 210, 34, GOLD)
+    cv.star4(886, 268, 26, GOLD)
+    cv.star4(120, 700, 20, (255, 240, 180))
+    cv.star4(918, 640, 22, GOLD)
+    return cv
 
 
 def main():
-    cv = Canvas(W, H)
-    draw_background(cv)
-    draw_ticket(cv)
-    draw_note(cv)
-
-    # headline: huge gold letters with a dark-red outline
-    draw_text_outline(cv, "THE NIGHT WE WON", 512, 108, 7, GOLD, RED_DARK)
-    draw_text_c(cv, "ONE TICKET. ONE NIGHT. FOREVER.", 512, 196, 2,
-                GOLD_PALE)
-
-    # foreground confetti: a few pieces land on top of everything
-    confetti = (GOLD, GOLD_PALE, RED_BRIGHT, WHITE, (120, 180, 255))
-    state = 31415926
-    for _ in range(90):
-        state = lcg(state)
-        x = 10 + state % 1004
-        state = lcg(state)
-        y = 10 + state % 1004
-        state = lcg(state)
-        size = 5 + state % 8
-        state = lcg(state)
-        col = confetti[state % len(confetti)]
-        state = lcg(state)
-        if state % 2 == 0:
-            cv.fill_rect(x, y, size, size // 2 + 2, col)
-        else:
-            cv.poly([(x, y - size // 2), (x + size // 2, y),
-                     (x, y + size // 2), (x - size // 2, y)], col)
-
-    out_dir = os.environ.get('MAKEFUN_OUTPUT_DIR')
-    if not out_dir:
-        out_dir = '/output' if os.path.isdir('/output') else '.'
-    os.makedirs(out_dir, exist_ok=True)
-    out = os.path.join(out_dir, 'entry.png')
-    data = png_bytes(cv.px, W, H)
-    with open(out, 'wb') as f:
-        f.write(data)
-    print("wrote", out, len(data), "bytes")
+    outdir = os.environ.get(OUT_ENV, "/output")
+    os.makedirs(outdir, exist_ok=True)
+    path = os.path.join(outdir, "entry.png")
+    with open(path, "wb") as f:
+        f.write(encode_png(render()))
+    print("wrote", path, os.path.getsize(path), "bytes")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
